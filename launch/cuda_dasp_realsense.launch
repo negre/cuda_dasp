@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+
+<launch>
+    
+    <include file="$(find realsense2_camera)/launch/rs_aligned_depth.launch"/>
+      
+    <node if="true" pkg="cuda_dasp" type="dasp_node" name="dasp_node" output="screen" clear_params="true" required="true">
+        <remap from="/camera_info" to="/camera/color/camera_info"/>
+        <remap from="/image_color" to="/camera/color/image_raw"/>
+        <remap from="/image_depth" to="/camera/aligned_depth_to_color/image_raw"/>
+	<param name="depth_scale" value="0.001"/>
+    </node>
+    
+</launch>
