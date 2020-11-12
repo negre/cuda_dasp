@@ -74,3 +74,7 @@ add_executable(dasp_node
 target_link_libraries(dasp_node
     dasp
     )
+
+#cuda_add_executable(test_grid_sync
+#	src/test_grid_sync.cu
+#)

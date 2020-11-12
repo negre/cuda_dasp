@@ -5,7 +5,6 @@
 #include <thrust/device_vector.h>
 #include <cuda_dasp/matrix_types.h>
 
-
 namespace cuda_dasp
 {
 
@@ -114,5 +113,8 @@ struct Accumulators
     }
 
 }; // struct Accumulators
+
+template<typename T>
+struct Queue;
 
 } // cuda_dasp

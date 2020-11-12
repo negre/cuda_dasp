@@ -46,6 +46,21 @@ DASP::DASP(const CamParam& cam_param,
     //labelsTex = new Surface<int>(labelsMat);
     rgbTex = new Texture<uchar4>(rgbMat);
     depthTex = new Texture<float>(depthMat);
+    
+    int dev = 0;
+    cudaMalloc(&syncCounter, 2*sizeof(unsigned int));
+    cudaMemset(syncCounter, 0, 2*sizeof(unsigned int));
+    
+    cudaMallocManaged(&queue, 2*sizeof(Queue<ushort2>));
+    cudaDeviceSynchronize();
+    
+    int numBlocksPerSm = 0;
+    numThreads = 512;
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, dev);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, daspProcessKernel, numThreads, 0);
+    numBlocks = deviceProp.multiProcessorCount * numBlocksPerSm;
+    
 }
 
 void DASP::seedsRandom()
@@ -129,7 +144,7 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
     dim3 dim_block_im(16, 16);
     dim3 dim_grid_im((rgb.cols + dim_block_im.x - 1) / dim_block_im.x,
                      (rgb.rows + dim_block_im.y - 1) / dim_block_im.y);
-
+    
     computeImages_kernel<<<dim_grid_im, dim_block_im>>>(rgbTex->getTextureObject(),
                                                         depthTex->getTextureObject(),
                                                         reinterpret_cast<float4*>(positionsMat.data),
@@ -157,7 +172,7 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
         cv::cuda::multiply(densityMat, cv::Scalar(density_scale_factor), densityMat);
         //densityMat.convertTo(densityMat, CV_32FC1, density_scale_factor);
     }
-
+    
     //seedsFloydSteinberg();
     seedsRandom();
 
@@ -173,25 +188,119 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
     superpixels.colors.resize(nb_seeds);
     superpixels.shapes.resize(nb_seeds);
     superpixels.crd.resize(nb_seeds);
-
+    
+    seedsQueue.resize(nb_seeds);
+    
     superpixels.setZeros(nb_seeds);
 
+    if(!accumulators.positions_sizes.empty())
+	accumulators.clear();
+    
+    accumulators.positions_sizes.resize(nb_seeds);
+    accumulators.normals.resize(nb_seeds);
+    accumulators.colors_densities.resize(nb_seeds);
+    accumulators.shapes.resize(nb_seeds);
+    accumulators.centers.resize(nb_seeds);
+    
+    accumulators.setZeros(nb_seeds);
+    
+    labelsMat.setTo(cv::Scalar(-1));
+    
     dim3 dim_block_list(128);
     dim3 dim_grid_list((nb_seeds + dim_block_list.x - 1) / dim_block_list.x);
-
-    initClusters_kernel<<<dim_grid_list, dim_block_list>>>(thrust::raw_pointer_cast(&superpixels.positions[0]),
-                                                           thrust::raw_pointer_cast(&superpixels.colors[0]),
-                                                           thrust::raw_pointer_cast(&superpixels.normals[0]),
-                                                           thrust::raw_pointer_cast(&superpixels.crd[0]),
-                                                           thrust::raw_pointer_cast(&seeds[0]),
-                                                           positionsTex->getTextureObject(),
-                                                           normalsTex->getTextureObject(),
-                                                           labTex->getTextureObject(),
-                                                           densityTex->getTextureObject(),
-                                                           nb_seeds);
+    
+    initClusters2_kernel<<<dim_grid_list, dim_block_list>>>(thrust::raw_pointer_cast(&superpixels.positions[0]),
+							    thrust::raw_pointer_cast(&superpixels.colors[0]),
+							    thrust::raw_pointer_cast(&superpixels.normals[0]),
+							    thrust::raw_pointer_cast(&superpixels.crd[0]),
+							    thrust::raw_pointer_cast(&seedsQueue[0]),
+							    thrust::raw_pointer_cast(&seeds[0]),
+							    positionsTex->getTextureObject(),
+							    normalsTex->getTextureObject(),
+							    labTex->getTextureObject(),
+							    densityTex->getTextureObject(),
+							    thrust::raw_pointer_cast(&accumulators.positions_sizes[0]),
+							    thrust::raw_pointer_cast(&accumulators.centers[0]),
+							    thrust::raw_pointer_cast(&accumulators.normals[0]),
+							    thrust::raw_pointer_cast(&accumulators.colors_densities[0]),
+							    thrust::raw_pointer_cast(&accumulators.shapes[0]),
+							    reinterpret_cast<int*>(labelsMat.data),
+							    nb_seeds,
+							    labelsMat.step / sizeof(int));
     cudaDeviceSynchronize();
     CudaCheckError();
-
+    
+//    unsigned int nbLocalElt = 100*(rgb.cols * rgb.rows + numBlocks - 1) / numBlocks;  
+//     localQueuesBuffer.resize(nbLocalElt * numBlocks);
+//     localQueuesBufferTmp.resize(localQueuesBuffer.size());
+//     unsigned int nbSeedsPerBlock = (nb_seeds+numBlocks-1)/numBlocks;
+//     int curSeeds = 0;
+//     for(int i=0; i<numBlocks; i++)
+//     {
+// 	int nbElt = nbSeedsPerBlock;
+// 	if(nb_seeds-curSeeds < nbSeedsPerBlock)
+// 	{
+// 	    nbElt = nb_seeds - curSeeds;
+// 	}
+// 	cudaMemcpyAsync(thrust::raw_pointer_cast(&localQueuesBuffer[i*nbLocalElt]),
+// 			thrust::raw_pointer_cast(&seedsQueue[curSeeds]),
+// 			nbElt*sizeof(ushort2),
+// 			cudaMemcpyDeviceToDevice,
+// 			0);
+// 	curSeeds += nbElt;
+//     }
+    
+//     cudaDeviceSynchronize();
+//     CudaCheckError();
+    
+    
+    queuesBuffer.resize(10 * rgb.cols * rgb.rows);
+    queuesBufferTmp.resize(queuesBuffer.size());
+    
+    queue[0].buf = thrust::raw_pointer_cast(&queuesBuffer[0]);
+    queue[1].buf = thrust::raw_pointer_cast(&queuesBufferTmp[0]);
+    queue[0].bufSize = queuesBuffer.size();
+    queue[1].bufSize = queuesBufferTmp.size();
+    queue[0].head = 0;
+    queue[1].head = 0;
+    queue[0].nbElt = nb_seeds;
+    queue[1].nbElt = 0;
+    
+    cudaMemcpy(thrust::raw_pointer_cast(&queuesBuffer[0]),
+	       thrust::raw_pointer_cast(&seedsQueue[0]),
+	       nb_seeds*sizeof(ushort2),
+	       cudaMemcpyDeviceToDevice);
+    
+    cudaDeviceSynchronize();
+    daspProcessKernel<<<numBlocks, numThreads>>>(thrust::raw_pointer_cast(&superpixels.positions[0]),
+						 thrust::raw_pointer_cast(&superpixels.colors[0]),
+						 thrust::raw_pointer_cast(&superpixels.normals[0]),
+						 thrust::raw_pointer_cast(&superpixels.crd[0]),
+						 positionsTex->getTextureObject(),
+						 normalsTex->getTextureObject(),
+						 labTex->getTextureObject(),
+						 densityTex->getTextureObject(),
+						 thrust::raw_pointer_cast(&accumulators.positions_sizes[0]),
+						 thrust::raw_pointer_cast(&accumulators.centers[0]),
+						 thrust::raw_pointer_cast(&accumulators.normals[0]),
+						 thrust::raw_pointer_cast(&accumulators.colors_densities[0]),
+						 thrust::raw_pointer_cast(&accumulators.shapes[0]),
+						 reinterpret_cast<int*>(labelsMat.data),
+						 queue,
+						 syncCounter,
+						 compactness,
+						 normalWeight,
+						 lambda,
+						 radiusMeter,
+						 nb_seeds,
+						 labelsMat.step / sizeof(int),
+						 cam.width,
+						 cam.height);
+    
+    cudaDeviceSynchronize();
+    CudaCheckError();
+    
+    /*
     for(int i = 0; i < nbIter; i++)
     {
         if(!accumulators.positions_sizes.empty())
@@ -282,7 +391,8 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
         cudaDeviceSynchronize();
         CudaCheckError();
     }
-
+    */
+    
     //if(doEnforceConnectivity)
     //    enforceConnectivity();
 

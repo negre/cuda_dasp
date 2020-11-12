@@ -1,6 +1,7 @@
 #include <cuda_dasp/dasp_kernels.cuh>
 //#include <cuda_dasp/vector_math.cuh>
 #include <cuda_dasp/matrix_math.cuh>
+#include <cuda_dasp/cuda_utils_dev.cuh>
 #include <stdio.h>
 
 
@@ -8,6 +9,29 @@
 
 namespace cuda_dasp
 {
+__device__ void syncAllThreads(unsigned int* syncCounter)
+
+{
+
+	__syncthreads();
+
+	if (threadIdx.x == 0) {
+
+		atomicInc(syncCounter, gridDim.x-1);
+
+		volatile unsigned int* counter = syncCounter;
+
+		do
+
+		{
+
+		} while (*counter > 0);
+
+	}
+
+	__syncthreads();
+
+}
 
 __device__ void eigenDecomposition(const Cov3& A, Mat33& eigenVecs, float3& eigenVals, int n)
 {
@@ -91,9 +115,16 @@ __device__ float computeDistance(const float3 pos1, const float3 lab1, const flo
                                  const float normal_weight,
                                  const float win_size)
 {
+    if(pos1.z==0.f || pos2.z==0.f)
+    {
+	return (1.0f - compactness) * ((1.0f - normal_weight) * (0.008f * squared_length(lab1 - lab2)));
+    }else
+    {
         return compactness * (squared_length(pos1 - pos2) / (radius*radius))
-               + (1.0f - compactness) * ((1.0f - normal_weight) * (0.008f * squared_length(lab1 - lab2))
-               + normal_weight * (1.0f - dot(norm1, norm2)));
+	    + (1.0f - compactness) * ((1.0f - normal_weight) * (0.008f * squared_length(lab1 - lab2))
+				      + normal_weight * (1.0f - dot(norm1, norm2)));
+    }
+    
 //    return compactness * (0.5f * squared_length(cent1 - cent2) + 0.5f * (squared_length(pos1 - pos2) / (radius*radius)))
 //           + (1.0f - compactness) * ((1.0f - normal_weight) * (0.001f * squared_length(lab1 - lab2))
 //           + normal_weight * (1.0f - dot(norm1, norm2)));
@@ -847,6 +878,314 @@ __global__ void updateClustersV2_kernel(float4* __restrict__ positions,
         shapes[idx] = new_shape;
     }
 }
+
+__global__ void initClusters2_kernel(float4* __restrict__ positions,
+				     float4* __restrict__ colors,
+				     float4* __restrict__ normals,
+				     float4* __restrict__ crd,
+				     ushort2* __restrict__ seeds_queue_buffer,
+				     const int2* __restrict__ seeds,
+				     cudaTextureObject_t tex_positions,
+				     cudaTextureObject_t tex_normals,
+				     cudaTextureObject_t tex_lab,
+				     cudaTextureObject_t tex_density,
+				     float4* __restrict__ acc_positions_sizes,
+				     float2* __restrict__ acc_centers,
+				     float4* __restrict__ acc_normals,
+				     float4* __restrict__ acc_colors_densities,
+				     Cov3* __restrict__ acc_shapes,
+				     int* __restrict__  im_labels,
+				     const int nb_clusters,
+				     const int step)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if(idx >= nb_clusters)
+        return;
+    
+    //printf("x %d  y %d", seeds[idx].x, seeds[idx].y);
+    int2 p_seed = seeds[idx];
+    
+    float4 pos = tex2D<float4>(tex_positions, p_seed.x, p_seed.y);
+    float4 color = tex2D<float4>(tex_lab, p_seed.x, p_seed.y);
+    float4 normal = tex2D<float4>(tex_normals, p_seed.x, p_seed.y); 
+    float density = tex2D<float>(tex_density, p_seed.x, p_seed.y);
+    positions[idx] = pos;
+    normals[idx] = normal;
+    colors[idx] = color;
+    
+    float r = sqrtf(1.0f / (PI * density));
+    crd[idx] = make_float4(float(p_seed.x), float(p_seed.y), r, density);
+    
+    acc_positions_sizes[idx].x = pos.x;
+    acc_positions_sizes[idx].y = pos.y;
+    acc_positions_sizes[idx].z = pos.z;
+    acc_positions_sizes[idx].w = 1.f;
+    acc_centers[idx].x = p_seed.x;
+    acc_centers[idx].y = p_seed.y;
+    acc_colors_densities[idx].x = color.x;
+    acc_colors_densities[idx].y = color.y;
+    acc_colors_densities[idx].z = color.z;
+    acc_colors_densities[idx].w = density;
+    acc_normals[idx] = normal;
+    
+    Cov3 cov = outer_product(make_float3(pos));
+    acc_shapes[idx] = cov;
+    
+    seeds_queue_buffer[idx].x = p_seed.x;
+    seeds_queue_buffer[idx].y = p_seed.y;
+    
+    im_labels[p_seed.y * step + p_seed.x] = idx;
+    
+}
+
+__global__ void daspProcessKernel(float4* __restrict__ positions,
+				  float4* __restrict__ colors,
+				  float4* __restrict__ normals,
+				  float4* __restrict__ crd,
+				  cudaTextureObject_t tex_positions,
+				  cudaTextureObject_t tex_normals,
+				  cudaTextureObject_t tex_lab,
+				  cudaTextureObject_t tex_density,
+				  float4* __restrict__ acc_positions_sizes,
+				  float2* __restrict__ acc_centers,
+				  float4* __restrict__ acc_normals,
+				  float4* __restrict__ acc_colors_densities,
+				  Cov3* __restrict__ acc_shapes,
+				  int* __restrict__  im_labels,
+				  Queue<ushort2> * __restrict__ queue,
+				  unsigned int * __restrict__ syncCounter,
+				  const float compactness,
+				  const float normal_weight,
+				  const float lambda,
+				  const float radius_meter,
+				  const int nb_clusters,
+				  const int step,
+				  const int width,
+				  const int height)
+{
+    int global_id = blockIdx.x *blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    
+    const int neighbor_pos[4][2] = {{-1,0},
+				    {1,0},
+				    {0,-1},
+				    {0,1}};
+    const int neighbor_id[4] = {-1,
+				1,
+				-step,
+				step};
+    
+    int cur_queue = 0;
+
+    for(;;)
+    {
+	for(;;)
+	{
+	    ushort2 elt;
+	    bool has_elt = queue[cur_queue].dequeue(&elt);
+	    if(__syncthreads_and(!has_elt))
+		break;
+	    if(has_elt)
+	    {
+		int id = elt.y*step+elt.x;
+		int label = im_labels[id];
+				
+		float3 cluster_position = make_float3(positions[label]);
+		float3 cluster_color = make_float3(colors[label]);
+		float3 cluster_normal = make_float3(normals[label]);
+		float4 cluster_crd = crd[label];
+		float2 cluster_center = make_float2(cluster_crd.x, cluster_crd.y);
+		float cluster_radius = cluster_crd.z;
+		float win_size = lambda * cluster_radius;
+		
+		for(int n=0; n<4; n++)
+		{
+		    int2 npos;
+		    int n_id = id+neighbor_id[n];
+		    npos.x = elt.x+neighbor_pos[n][0];
+		    npos.y = elt.y+neighbor_pos[n][1];
+		    
+		    float2 pos = make_float2(npos.x, npos.y);
+		    
+		    if(npos.x>=0 && npos.x<width
+		       && npos.y>=0 && npos.y<height)
+		    {
+
+			float3 position = make_float3(tex2D<float4>(tex_positions, npos.x, npos.y));
+			float3 color = make_float3(tex2D<float4>(tex_lab, npos.x, npos.y));
+			float3 normal = make_float3(tex2D<float4>(tex_normals, npos.x, npos.y));
+			float density = tex2D<float>(tex_density, npos.x, npos.y);
+			
+			float dist = computeDistance(cluster_position, cluster_color, cluster_normal, cluster_center,
+						     position, color, normal, pos,
+						     radius_meter,
+						     compactness,
+						     normal_weight,
+						     win_size);
+			
+			
+			for(;;)
+			{
+			    float curDist;
+			    int cur_label = im_labels[n_id];
+			    
+			    if(cur_label<0){
+				curDist = INFINITY;
+			    }else if(cur_label==label){
+				curDist = dist;
+			    }else{
+				float3 cur_cluster_position = make_float3(positions[cur_label]);
+				float3 cur_cluster_color = make_float3(colors[cur_label]);
+				float3 cur_cluster_normal = make_float3(normals[cur_label]);
+				float4 cur_cluster_crd = crd[cur_label];
+				float2 cur_cluster_center = make_float2(cur_cluster_crd.x, cur_cluster_crd.y);
+				float cur_cluster_radius = cur_cluster_crd.z;
+				float cur_win_size = lambda * cur_cluster_radius;
+				
+				curDist = computeDistance(cur_cluster_position, cur_cluster_color, cur_cluster_normal, cur_cluster_center,
+							  position, color, normal, pos,
+							  radius_meter,
+							  compactness,
+							  normal_weight,
+							  cur_win_size);
+				
+			    }
+			    if(dist<curDist)
+			    {
+				int old = atomicCAS(&im_labels[n_id], cur_label, label);
+				if(old==cur_label)
+				{
+				    ushort2 n_elt = make_ushort2(npos.x, npos.y);
+				    queue[1-cur_queue].enqueue(n_elt);
+// 				    if(!queue[1-cur_queue].enqueue(n_elt))
+// 				    {
+// 					printf("queue full\n");
+// 				    }
+				    
+				    // increment "label" accumulator
+				    Cov3 cov = outer_product(position);
+				    
+				    atomicAdd(&acc_positions_sizes[label].x, position.x);
+				    atomicAdd(&acc_positions_sizes[label].y, position.y);
+				    atomicAdd(&acc_positions_sizes[label].z, position.z);
+				    atomicAdd(&acc_positions_sizes[label].w, 1.0f);
+				    atomicAdd(&acc_colors_densities[label].x, color.x);
+				    atomicAdd(&acc_colors_densities[label].y, color.y);
+				    atomicAdd(&acc_colors_densities[label].z, color.z);
+				    atomicAdd(&acc_colors_densities[label].w, density);
+				    atomicAdd(&acc_centers[label].x, pos.x);
+				    atomicAdd(&acc_centers[label].y, pos.y);
+				    atomicAdd(&acc_normals[label].x, normal.x);
+				    atomicAdd(&acc_normals[label].y, normal.y);
+				    atomicAdd(&acc_normals[label].z, normal.z);
+				    
+				    atomicAdd(&acc_shapes[label].xx, cov.xx);
+				    atomicAdd(&acc_shapes[label].xy, cov.xy);
+				    atomicAdd(&acc_shapes[label].xz, cov.xz);
+				    atomicAdd(&acc_shapes[label].yy, cov.yy);
+				    atomicAdd(&acc_shapes[label].yz, cov.yz);
+				    atomicAdd(&acc_shapes[label].zz, cov.zz);
+				    
+				    
+				    // and decrement "cur_label" accumulator
+				    atomicAdd(&acc_positions_sizes[cur_label].x, -position.x);
+				    atomicAdd(&acc_positions_sizes[cur_label].y, -position.y);
+				    atomicAdd(&acc_positions_sizes[cur_label].z, -position.z);
+				    atomicAdd(&acc_positions_sizes[cur_label].w, -1.0f);
+				    atomicAdd(&acc_colors_densities[cur_label].x, -color.x);
+				    atomicAdd(&acc_colors_densities[cur_label].y, -color.y);
+				    atomicAdd(&acc_colors_densities[cur_label].z, -color.z);
+				    atomicAdd(&acc_colors_densities[cur_label].w, -density);
+				    atomicAdd(&acc_centers[cur_label].x, -pos.x);
+				    atomicAdd(&acc_centers[cur_label].y, -pos.y);
+				    atomicAdd(&acc_normals[cur_label].x, -normal.x);
+				    atomicAdd(&acc_normals[cur_label].y, -normal.y);
+				    atomicAdd(&acc_normals[cur_label].z, -normal.z);
+				    
+				    atomicAdd(&acc_shapes[cur_label].xx, -cov.xx);
+				    atomicAdd(&acc_shapes[cur_label].xy, -cov.xy);
+				    atomicAdd(&acc_shapes[cur_label].xz, -cov.xz);
+				    atomicAdd(&acc_shapes[cur_label].yy, -cov.yy);
+				    atomicAdd(&acc_shapes[cur_label].yz, -cov.yz);
+				    atomicAdd(&acc_shapes[cur_label].zz, -cov.zz);
+				      
+				    break;
+				}
+			    }else
+			    {
+				break;
+			    }
+			}
+		    }
+		}
+	    }
+	    
+	    __syncthreads();
+	}
+	
+// 	if(tid==0)
+// 	{
+// 	    printf("%d waiting other blocks\n", blockIdx.x);
+// 	}
+	syncAllThreads(&syncCounter[0]);
+	
+	if(queue[1-cur_queue].nbElt==0)
+	{
+// 	    printf("return\n");
+	    return;
+	}
+
+	__syncthreads();
+	
+	cur_queue = 1-cur_queue;
+	
+	// update clusters
+	for(int k = global_id; k<nb_clusters; k+=blockDim.x*gridDim.x)
+	{
+	    float4 acc_ps = acc_positions_sizes[k];
+	    float size = acc_ps.w;
+	    float4 mean_cd = acc_colors_densities[k] / size;
+	    
+	    float3 new_color = make_float3(mean_cd.x, mean_cd.y, mean_cd.z);
+	    //printf("%f %f %f", new_color.x, new_color.y, new_color.z);
+	    float new_density = mean_cd.w;
+	    float3 new_position = make_float3(acc_ps.x, acc_ps.y, acc_ps.z) / size;
+	    float2 new_center = acc_centers[k] / size;
+	    
+	    Cov3 new_shape = acc_shapes[k] / size - outer_product(new_position);
+	    
+	    float3 eigen_vals;
+	    Mat33 eigen_vecs;
+	    eigenDecomposition(new_shape, eigen_vecs, eigen_vals, 10);
+	    
+	    float3 new_normal;
+	    
+	    if(eigen_vals.x < 1e-6f || eigen_vals.y < 1e-6f || eigen_vals.x / eigen_vals.y > 100.f)
+		new_normal = eigen_vecs.rows[2];
+	    else new_normal = make_float3(acc_normals[k]) / size;
+	    
+	    float new_radius = sqrtf(1.0f / (PI * new_density));
+	    
+	    positions[k] = make_float4(new_position);
+	    colors[k] = make_float4(new_color);
+	    normals[k] = make_float4(new_normal);
+	    crd[k] = make_float4(new_center.x, new_center.y, new_radius, new_density);
+	    //shapes[k] = new_shape;
+	}
+	
+	
+	
+// 	if(tid==0 && blockIdx.x==0)
+// 	{
+// 	    printf("swap buffer\n");
+// 	}
+	
+	syncAllThreads(&syncCounter[1]);
+    }
+}
+
+
 
 __global__ void renderBoundaryImage_kernel(uchar4* __restrict__ boundary_im,
                                            cudaTextureObject_t tex_labels,

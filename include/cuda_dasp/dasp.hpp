@@ -39,6 +39,16 @@ private:
     thrust::device_vector<int2> seeds;
     Superpixels superpixels;
     Accumulators accumulators;
+    
+    
+    Queue<ushort2> *queue; 
+    thrust::device_vector<ushort2> seedsQueue;
+    thrust::device_vector<ushort2> queuesBuffer, queuesBufferTmp;
+    
+    unsigned int* syncCounter;
+    int numBlocks;
+    int numThreads;
+
     float compactness, normalWeight;
     int nbIter;
     float lambda;
