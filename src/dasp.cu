@@ -6,7 +6,7 @@
 #include <random>
 #include <opencv2/cudaarithm.hpp>
 #include <chrono>
-
+#include <curand_kernel.h>
 
 namespace cuda_dasp
 {
@@ -46,16 +46,41 @@ DASP::DASP(const CamParam& cam_param,
     //labelsTex = new Surface<int>(labelsMat);
     rgbTex = new Texture<uchar4>(rgbMat);
     depthTex = new Texture<float>(depthMat);
+
+    randStates.resize(cam.width*cam.height);
+    dim3 dim_block_im(16, 16);
+    dim3 dim_grid_im((cam.width + dim_block_im.x - 1) / dim_block_im.x,
+                     (cam.height + dim_block_im.y - 1) / dim_block_im.y);
+    
+    initRandStates_kernel<<<dim_grid_im, dim_block_im>>>(thrust::raw_pointer_cast(&randStates[0]),
+							 cam.width,
+							 cam.height);
     
     int dev = 0;
     cudaMalloc(&syncCounter, 2*sizeof(unsigned int));
     cudaMemset(syncCounter, 0, 2*sizeof(unsigned int));
     
+    cudaMalloc(&endFlag, sizeof(int));
+    cudaMemset(endFlag, 0, sizeof(int));
+    
     cudaMallocManaged(&queue, 2*sizeof(Queue<ushort2>));
     cudaDeviceSynchronize();
     
+    queuesBuffer.resize(10 * cam.width * cam.height);
+    queuesBufferTmp.resize(queuesBuffer.size());
+    
+    queue[0].buf = thrust::raw_pointer_cast(&queuesBuffer[0]);
+    queue[1].buf = thrust::raw_pointer_cast(&queuesBufferTmp[0]);
+    queue[0].bufSize = queuesBuffer.size();
+    queue[1].bufSize = queuesBufferTmp.size();
+    queue[0].head = 0;
+    queue[1].head = 0;
+    queue[0].nbElt = 0;
+    queue[1].nbElt = 0;
+    cudaDeviceSynchronize();
+    
     int numBlocksPerSm = 0;
-    numThreads = 512;
+    numThreads = 256;
     cudaDeviceProp deviceProp;
     cudaGetDeviceProperties(&deviceProp, dev);
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocksPerSm, daspProcessKernel, numThreads, 0);
@@ -134,7 +159,7 @@ void DASP::seedsFloydSteinberg()
 void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
 {
     auto start = std::chrono::high_resolution_clock::now();
-
+    
     cv::cuda::GpuMat rgb_d;
     rgb_d.upload(rgb);
     cv::cuda::cvtColor(rgb_d, rgbMat, cv::COLOR_RGB2RGBA);
@@ -162,9 +187,9 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
                                                         positionsMat.step / sizeof(float4),
                                                         gradientMat.step / sizeof(float2),
                                                         densityMat.step / sizeof(float));
-    cudaDeviceSynchronize();
-    CudaCheckError();
-
+    //cudaDeviceSynchronize();
+    //CudaCheckError();
+    
     if(nbSuperpixels > 0)
     {
         float total_density = float(cv::cuda::sum(densityMat)[0]);
@@ -174,22 +199,36 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
     }
     
     //seedsFloydSteinberg();
-    seedsRandom();
-
-    size_t nb_seeds = seeds.size();
-
+    //seedsRandom();
+    
+    queue[0].head = 0;
+    queue[1].head = 0;
+    queue[0].nbElt = 0;
+    queue[1].nbElt = 0;
+    cudaDeviceSynchronize();
+    
+    generateSeeds_kernel<<<dim_grid_im, dim_block_im>>>(thrust::raw_pointer_cast(&queuesBuffer[0]),
+							thrust::raw_pointer_cast(&randStates[0]),
+							&(queue[0].nbElt),
+							densityTex->getTextureObject(),
+							cam.width,
+							cam.height);
+    cudaDeviceSynchronize();
+    //size_t nb_seeds = seeds.size();
+    size_t nb_seeds = queue[0].nbElt;
+    
     std::cout<<"nb seeds = "<<nb_seeds<<std::endl;
-
-    if(!superpixels.positions.empty())
-        superpixels.clear();
-
+    
+    //if(!superpixels.positions.empty())
+    //    superpixels.clear();
+    
     superpixels.positions.resize(nb_seeds);
     superpixels.normals.resize(nb_seeds);
     superpixels.colors.resize(nb_seeds);
     superpixels.shapes.resize(nb_seeds);
     superpixels.crd.resize(nb_seeds);
     
-    seedsQueue.resize(nb_seeds);
+//     seedsQueue.resize(nb_seeds);
     
     superpixels.setZeros(nb_seeds);
 
@@ -213,8 +252,7 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
 							    thrust::raw_pointer_cast(&superpixels.colors[0]),
 							    thrust::raw_pointer_cast(&superpixels.normals[0]),
 							    thrust::raw_pointer_cast(&superpixels.crd[0]),
-							    thrust::raw_pointer_cast(&seedsQueue[0]),
-							    thrust::raw_pointer_cast(&seeds[0]),
+							    queue[0].buf,
 							    positionsTex->getTextureObject(),
 							    normalsTex->getTextureObject(),
 							    labTex->getTextureObject(),
@@ -254,24 +292,13 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
 //     CudaCheckError();
     
     
-    queuesBuffer.resize(10 * rgb.cols * rgb.rows);
-    queuesBufferTmp.resize(queuesBuffer.size());
     
-    queue[0].buf = thrust::raw_pointer_cast(&queuesBuffer[0]);
-    queue[1].buf = thrust::raw_pointer_cast(&queuesBufferTmp[0]);
-    queue[0].bufSize = queuesBuffer.size();
-    queue[1].bufSize = queuesBufferTmp.size();
-    queue[0].head = 0;
-    queue[1].head = 0;
-    queue[0].nbElt = nb_seeds;
-    queue[1].nbElt = 0;
+//     cudaMemcpy(thrust::raw_pointer_cast(&queuesBuffer[0]),
+// 	       thrust::raw_pointer_cast(&seedsQueue[0]),
+// 	       nb_seeds*sizeof(ushort2),
+// 	       cudaMemcpyDeviceToDevice);
     
-    cudaMemcpy(thrust::raw_pointer_cast(&queuesBuffer[0]),
-	       thrust::raw_pointer_cast(&seedsQueue[0]),
-	       nb_seeds*sizeof(ushort2),
-	       cudaMemcpyDeviceToDevice);
-    
-    cudaDeviceSynchronize();
+//     cudaDeviceSynchronize();
     daspProcessKernel<<<numBlocks, numThreads>>>(thrust::raw_pointer_cast(&superpixels.positions[0]),
 						 thrust::raw_pointer_cast(&superpixels.colors[0]),
 						 thrust::raw_pointer_cast(&superpixels.normals[0]),
@@ -288,6 +315,7 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
 						 reinterpret_cast<int*>(labelsMat.data),
 						 queue,
 						 syncCounter,
+						 endFlag,
 						 compactness,
 						 normalWeight,
 						 lambda,

@@ -5,7 +5,7 @@
 #include <cuda_dasp/texture.hpp>
 //#include <cuda_dasp/surface.hpp>
 #include <opencv2/core/cuda.hpp>
-
+#include <curand_kernel.h>
 
 namespace cuda_dasp
 {
@@ -37,6 +37,7 @@ private:
     cv::Ptr<Texture<int>> labelsTex; // TODO use surface memory instead?
     //cv::Ptr<Surface<int>> labelsTex;
     thrust::device_vector<int2> seeds;
+    thrust::device_vector<curandState> randStates;
     Superpixels superpixels;
     Accumulators accumulators;
     
@@ -46,9 +47,10 @@ private:
     thrust::device_vector<ushort2> queuesBuffer, queuesBufferTmp;
     
     unsigned int* syncCounter;
+    int* endFlag;
     int numBlocks;
     int numThreads;
-
+    
     float compactness, normalWeight;
     int nbIter;
     float lambda;

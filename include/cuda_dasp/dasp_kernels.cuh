@@ -2,6 +2,7 @@
 
 #include <cuda_dasp/dasp.hpp>
 #include <cuda_dasp/cuda_utils_dev.cuh>
+#include <curand_kernel.h>
 
 namespace cuda_dasp
 {
@@ -66,6 +67,17 @@ __global__ void computeImages_kernel(cudaTextureObject_t tex_rgb,
                                      const int step_ch2,
                                      const int step_ch1);
 
+__global__ void initRandStates_kernel(curandState *state,
+				      unsigned int width,
+				      unsigned int height);
+
+__global__ void generateSeeds_kernel(ushort2* __restrict__ seeds_queue_buffer,
+				     curandState *state,
+				     int* nb_seeds,
+				     cudaTextureObject_t tex_density,
+				     const int width,
+				     const int height);
+
 __global__ void initClusters_kernel(float4* __restrict__ positions,
                                     float4* __restrict__ colors,
                                     float4* __restrict__ normals,
@@ -81,8 +93,7 @@ __global__ void initClusters2_kernel(float4* __restrict__ positions,
 				     float4* __restrict__ colors,
 				     float4* __restrict__ normals,
 				     float4* __restrict__ crd,
-				     ushort2* __restrict__ seeds_queue_buffer,
-				     const int2* __restrict__ seeds,
+				     const ushort2* __restrict__ seeds,
 				     cudaTextureObject_t tex_positions,
 				     cudaTextureObject_t tex_normals,
 				     cudaTextureObject_t tex_lab,
@@ -209,6 +220,7 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				  int* __restrict__  im_labels,
 				  Queue<ushort2>* queue,
 				  unsigned int *syncCounter,
+				  int * __restrict__ endFlag,
 				  const float compactness,
 				  const float normal_weight,
 				  const float lambda,

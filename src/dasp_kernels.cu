@@ -3,7 +3,7 @@
 #include <cuda_dasp/matrix_math.cuh>
 #include <cuda_dasp/cuda_utils_dev.cuh>
 #include <stdio.h>
-
+#include <curand_kernel.h>
 
 #define PI 3.14159265
 
@@ -879,12 +879,60 @@ __global__ void updateClustersV2_kernel(float4* __restrict__ positions,
     }
 }
 
+
+__global__ void initRandStates_kernel(curandState *state,
+				      unsigned int width,
+				      unsigned int height)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    int id = y*width+x;
+    
+    if(x<width && y<height)
+    {
+	curand_init(1234, id, 0, &state[id]);
+    }
+}
+
+__global__ void generateSeeds_kernel(ushort2* __restrict__ seeds_queue_buffer,
+				     curandState *state,
+				     int* nb_seeds,
+				     cudaTextureObject_t tex_density,
+				     const int width,
+				     const int height)
+{
+    int x = threadIdx.x + blockIdx.x * blockDim.x;
+    int y = threadIdx.y + blockIdx.y * blockDim.y;
+    
+    if(x>=width | y>=height)
+	return;
+    
+    int id = y*width+x;
+    
+    float density = tex2D<float>(tex_density, x, y);
+    
+    if(density>0.f)
+    {
+	curandState rng = state[id];
+	
+	if(curand_uniform(&rng) < density)
+	{
+	    unsigned int seedId = atomicAggInc(nb_seeds);
+	    seeds_queue_buffer[seedId] = make_ushort2(x,y);
+	}
+	
+	
+	state[id] = rng;
+    }
+}
+
+
 __global__ void initClusters2_kernel(float4* __restrict__ positions,
 				     float4* __restrict__ colors,
 				     float4* __restrict__ normals,
 				     float4* __restrict__ crd,
-				     ushort2* __restrict__ seeds_queue_buffer,
-				     const int2* __restrict__ seeds,
+				     const ushort2* __restrict__ seeds,
 				     cudaTextureObject_t tex_positions,
 				     cudaTextureObject_t tex_normals,
 				     cudaTextureObject_t tex_lab,
@@ -904,7 +952,7 @@ __global__ void initClusters2_kernel(float4* __restrict__ positions,
         return;
     
     //printf("x %d  y %d", seeds[idx].x, seeds[idx].y);
-    int2 p_seed = seeds[idx];
+    ushort2 p_seed = seeds[idx];
     
     float4 pos = tex2D<float4>(tex_positions, p_seed.x, p_seed.y);
     float4 color = tex2D<float4>(tex_lab, p_seed.x, p_seed.y);
@@ -931,13 +979,12 @@ __global__ void initClusters2_kernel(float4* __restrict__ positions,
     
     Cov3 cov = outer_product(make_float3(pos));
     acc_shapes[idx] = cov;
-    
-    seeds_queue_buffer[idx].x = p_seed.x;
-    seeds_queue_buffer[idx].y = p_seed.y;
-    
+        
     im_labels[p_seed.y * step + p_seed.x] = idx;
     
 }
+
+// #define SHM_QUEUE_SIZE 256
 
 __global__ void daspProcessKernel(float4* __restrict__ positions,
 				  float4* __restrict__ colors,
@@ -955,6 +1002,7 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				  int* __restrict__  im_labels,
 				  Queue<ushort2> * __restrict__ queue,
 				  unsigned int * __restrict__ syncCounter,
+				  int * __restrict__ endFlag,
 				  const float compactness,
 				  const float normal_weight,
 				  const float lambda,
@@ -964,6 +1012,9 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				  const int width,
 				  const int height)
 {
+//     __shared__ Queue<ushort2> shm_queue[2];
+//     __shared__ ushort2 shm_buf[2*SHM_QUEUE_SIZE];
+    
     int global_id = blockIdx.x *blockDim.x + threadIdx.x;
     int tid = threadIdx.x;
     
@@ -976,6 +1027,17 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				-step,
 				step};
     
+//     if(tid==0)
+//     {
+// 	shm_queue[0].buf = &shm_buf[0];
+// 	shm_queue[1].buf = &shm_buf[SHM_QUEUE_SIZE];
+// 	shm_queue[0].bufSize = shm_queue[1].bufSize = SHM_QUEUE_SIZE;
+// 	shm_queue[0].head = shm_queue[1].head = 0;
+// 	shm_queue[0].nbElt = shm_queue[1].nbElt = 0;
+//     }
+    
+//     __syncthreads();
+    
     int cur_queue = 0;
 
     for(;;)
@@ -983,7 +1045,11 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 	for(;;)
 	{
 	    ushort2 elt;
-	    bool has_elt = queue[cur_queue].dequeue(&elt);
+// 	    bool has_elt = shm_queue[cur_queue].dequeue(&elt);
+// 	    if(!has_elt)
+// 		has_elt = queue[cur_queue].dequeue(&elt);
+ 	    bool has_elt = queue[cur_queue].dequeue(&elt);
+	    
 	    if(__syncthreads_and(!has_elt))
 		break;
 	    if(has_elt)
@@ -1057,59 +1123,87 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				if(old==cur_label)
 				{
 				    ushort2 n_elt = make_ushort2(npos.x, npos.y);
-				    queue[1-cur_queue].enqueue(n_elt);
-// 				    if(!queue[1-cur_queue].enqueue(n_elt))
+//  				    if(!shm_queue[1-cur_queue].enqueue(n_elt))
+					queue[1-cur_queue].enqueue(n_elt);
+				    
+// 				    
+//				    if(!queue[1-cur_queue].enqueue(n_elt))
 // 				    {
 // 					printf("queue full\n");
 // 				    }
 				    
 				    // increment "label" accumulator
 				    Cov3 cov = outer_product(position);
+				    /*
+				    atomicAdd(&acc_positions_sizes[label].x, 0.f);
+				    atomicAdd(&acc_positions_sizes[label].y, 0.f);
+				    atomicAdd(&acc_positions_sizes[label].z, 0.f);
+				    atomicAdd(&acc_positions_sizes[label].w, 0.f);
+				    atomicAdd(&acc_colors_densities[label].x, 0.f);
+				    atomicAdd(&acc_colors_densities[label].y, 0.f);
+				    atomicAdd(&acc_colors_densities[label].z, 0.f);
+				    atomicAdd(&acc_colors_densities[label].w, 0.f);
+				    atomicAdd(&acc_centers[label].x, 0.f);
+				    atomicAdd(&acc_centers[label].y, 0.f);
+				    atomicAdd(&acc_normals[label].x, 0.f);
+				    atomicAdd(&acc_normals[label].y, 0.f);
+				    atomicAdd(&acc_normals[label].z, 0.f);
 				    
-				    atomicAdd(&acc_positions_sizes[label].x, position.x);
-				    atomicAdd(&acc_positions_sizes[label].y, position.y);
-				    atomicAdd(&acc_positions_sizes[label].z, position.z);
-				    atomicAdd(&acc_positions_sizes[label].w, 1.0f);
-				    atomicAdd(&acc_colors_densities[label].x, color.x);
-				    atomicAdd(&acc_colors_densities[label].y, color.y);
-				    atomicAdd(&acc_colors_densities[label].z, color.z);
-				    atomicAdd(&acc_colors_densities[label].w, density);
-				    atomicAdd(&acc_centers[label].x, pos.x);
-				    atomicAdd(&acc_centers[label].y, pos.y);
-				    atomicAdd(&acc_normals[label].x, normal.x);
-				    atomicAdd(&acc_normals[label].y, normal.y);
-				    atomicAdd(&acc_normals[label].z, normal.z);
+				    atomicAdd(&acc_shapes[label].xx, 0.f);
+				    atomicAdd(&acc_shapes[label].xy, 0.f);
+				    atomicAdd(&acc_shapes[label].xz, 0.f);
+				    atomicAdd(&acc_shapes[label].yy, 0.f);
+				    atomicAdd(&acc_shapes[label].yz, 0.f);
+				    atomicAdd(&acc_shapes[label].zz, 0.f);
+				    */
 				    
-				    atomicAdd(&acc_shapes[label].xx, cov.xx);
-				    atomicAdd(&acc_shapes[label].xy, cov.xy);
-				    atomicAdd(&acc_shapes[label].xz, cov.xz);
-				    atomicAdd(&acc_shapes[label].yy, cov.yy);
-				    atomicAdd(&acc_shapes[label].yz, cov.yz);
-				    atomicAdd(&acc_shapes[label].zz, cov.zz);
+				    if(position.z!=0)
+				    {
+					atomicAdd(&acc_positions_sizes[label].x, position.x);
+					atomicAdd(&acc_positions_sizes[label].y, position.y);
+					atomicAdd(&acc_positions_sizes[label].z, position.z);
+					atomicAdd(&acc_positions_sizes[label].w, 1.0f);
+					atomicAdd(&acc_colors_densities[label].x, color.x);
+					atomicAdd(&acc_colors_densities[label].y, color.y);
+					atomicAdd(&acc_colors_densities[label].z, color.z);
+					atomicAdd(&acc_colors_densities[label].w, density);
+					atomicAdd(&acc_centers[label].x, pos.x);
+					atomicAdd(&acc_centers[label].y, pos.y);
+					atomicAdd(&acc_normals[label].x, normal.x);
+					atomicAdd(&acc_normals[label].y, normal.y);
+					atomicAdd(&acc_normals[label].z, normal.z);
+					
+					atomicAdd(&acc_shapes[label].xx, cov.xx);
+					atomicAdd(&acc_shapes[label].xy, cov.xy);
+					atomicAdd(&acc_shapes[label].xz, cov.xz);
+					atomicAdd(&acc_shapes[label].yy, cov.yy);
+					atomicAdd(&acc_shapes[label].yz, cov.yz);
+					atomicAdd(&acc_shapes[label].zz, cov.zz);
+					
+					
+					// and decrement "cur_label" accumulator
+					atomicAdd(&acc_positions_sizes[cur_label].x, -position.x);
+					atomicAdd(&acc_positions_sizes[cur_label].y, -position.y);
+					atomicAdd(&acc_positions_sizes[cur_label].z, -position.z);
+					atomicAdd(&acc_positions_sizes[cur_label].w, -1.0f);
+					atomicAdd(&acc_colors_densities[cur_label].x, -color.x);
+					atomicAdd(&acc_colors_densities[cur_label].y, -color.y);
+					atomicAdd(&acc_colors_densities[cur_label].z, -color.z);
+					atomicAdd(&acc_colors_densities[cur_label].w, -density);
+					atomicAdd(&acc_centers[cur_label].x, -pos.x);
+					atomicAdd(&acc_centers[cur_label].y, -pos.y);
+					atomicAdd(&acc_normals[cur_label].x, -normal.x);
+					atomicAdd(&acc_normals[cur_label].y, -normal.y);
+					atomicAdd(&acc_normals[cur_label].z, -normal.z);
+					
+					atomicAdd(&acc_shapes[cur_label].xx, -cov.xx);
+					atomicAdd(&acc_shapes[cur_label].xy, -cov.xy);
+					atomicAdd(&acc_shapes[cur_label].xz, -cov.xz);
+					atomicAdd(&acc_shapes[cur_label].yy, -cov.yy);
+					atomicAdd(&acc_shapes[cur_label].yz, -cov.yz);
+					atomicAdd(&acc_shapes[cur_label].zz, -cov.zz);
+				    }
 				    
-				    
-				    // and decrement "cur_label" accumulator
-				    atomicAdd(&acc_positions_sizes[cur_label].x, -position.x);
-				    atomicAdd(&acc_positions_sizes[cur_label].y, -position.y);
-				    atomicAdd(&acc_positions_sizes[cur_label].z, -position.z);
-				    atomicAdd(&acc_positions_sizes[cur_label].w, -1.0f);
-				    atomicAdd(&acc_colors_densities[cur_label].x, -color.x);
-				    atomicAdd(&acc_colors_densities[cur_label].y, -color.y);
-				    atomicAdd(&acc_colors_densities[cur_label].z, -color.z);
-				    atomicAdd(&acc_colors_densities[cur_label].w, -density);
-				    atomicAdd(&acc_centers[cur_label].x, -pos.x);
-				    atomicAdd(&acc_centers[cur_label].y, -pos.y);
-				    atomicAdd(&acc_normals[cur_label].x, -normal.x);
-				    atomicAdd(&acc_normals[cur_label].y, -normal.y);
-				    atomicAdd(&acc_normals[cur_label].z, -normal.z);
-				    
-				    atomicAdd(&acc_shapes[cur_label].xx, -cov.xx);
-				    atomicAdd(&acc_shapes[cur_label].xy, -cov.xy);
-				    atomicAdd(&acc_shapes[cur_label].xz, -cov.xz);
-				    atomicAdd(&acc_shapes[cur_label].yy, -cov.yy);
-				    atomicAdd(&acc_shapes[cur_label].yz, -cov.yz);
-				    atomicAdd(&acc_shapes[cur_label].zz, -cov.zz);
-				      
 				    break;
 				}
 			    }else
@@ -1124,11 +1218,23 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 	    __syncthreads();
 	}
 	
-// 	if(tid==0)
-// 	{
-// 	    printf("%d waiting other blocks\n", blockIdx.x);
-// 	}
+//  	if(tid==0 && shm_queue[1-cur_queue].nbElt!=0)
+//  	{
+// 	    atomicAdd(endFlag, 1);
+// // 	    printf("%d waiting other blocks\n", blockIdx.x);
+//  	}
+	
 	syncAllThreads(&syncCounter[0]);
+	
+// 	if(*endFlag == 0)
+// 	{
+// 	    return;
+// 	}
+
+// 	if(tid==0 && shm_queue[1-cur_queue].nbElt!=0)
+// 	{
+// 	    atomicAdd(endFlag, -1);
+// 	}
 	
 	if(queue[1-cur_queue].nbElt==0)
 	{
@@ -1182,6 +1288,7 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 // 	}
 	
 	syncAllThreads(&syncCounter[1]);
+	
     }
 }
 
