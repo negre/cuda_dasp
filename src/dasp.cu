@@ -56,7 +56,6 @@ DASP::DASP(const CamParam& cam_param,
 							 cam.width,
 							 cam.height);
     
-    int dev = 0;
     cudaMalloc(&syncCounter, 2*sizeof(unsigned int));
     cudaMemset(syncCounter, 0, 2*sizeof(unsigned int));
     
@@ -79,6 +78,7 @@ DASP::DASP(const CamParam& cam_param,
     queue[1].nbElt = 0;
     cudaDeviceSynchronize();
     
+    int dev = 0;
     int numBlocksPerSm = 0;
     numThreads = 256;
     cudaDeviceProp deviceProp;
@@ -230,7 +230,7 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
     
 //     seedsQueue.resize(nb_seeds);
     
-    superpixels.setZeros(nb_seeds);
+//    superpixels.setZeros(nb_seeds);
 
     if(!accumulators.positions_sizes.empty())
 	accumulators.clear();
@@ -320,6 +320,7 @@ void DASP::computeSuperpixels(const cv::Mat& rgb, const cv::Mat& depth)
 						 normalWeight,
 						 lambda,
 						 radiusMeter,
+						 100,
 						 nb_seeds,
 						 labelsMat.step / sizeof(int),
 						 cam.width,

@@ -108,22 +108,22 @@ __device__ void eigenDecomposition(const Cov3& A, Mat33& eigenVecs, float3& eige
         eigenVals.z = (A.xz*eigenVecs.rows[2].x+A.yz*eigenVecs.rows[2].y+A.zz*eigenVecs.rows[2].z) / eigenVecs.rows[2].z;
 }
 
-__device__ float computeDistance(const float3 pos1, const float3 lab1, const float3 norm1, const float2 cent1,
-                                 const float3 pos2, const float3 lab2, const float3 norm2, const float2 cent2,
-                                 const float radius,
-                                 const float compactness,
-                                 const float normal_weight,
-                                 const float win_size)
+__device__ __inline__ float computeDistance(const float3 pos1, const float3 lab1, const float3 norm1, const float2 cent1,
+					    const float3 pos2, const float3 lab2, const float3 norm2, const float2 cent2,
+					    const float radius,
+					    const float compactness,
+					    const float normal_weight,
+					    const float win_size)
 {
-    if(pos1.z==0.f || pos2.z==0.f)
-    {
-	return (1.0f - compactness) * ((1.0f - normal_weight) * (0.008f * squared_length(lab1 - lab2)));
-    }else
-    {
+//     if(pos1.z==0.f || pos2.z==0.f)
+//     {
+// 	return (1.0f - compactness) * ((1.0f - normal_weight) * (0.008f * squared_length(lab1 - lab2)));
+//     }else
+//     {
         return compactness * (squared_length(pos1 - pos2) / (radius*radius))
 	    + (1.0f - compactness) * ((1.0f - normal_weight) * (0.008f * squared_length(lab1 - lab2))
 				      + normal_weight * (1.0f - dot(norm1, norm2)));
-    }
+//     }
     
 //    return compactness * (0.5f * squared_length(cent1 - cent2) + 0.5f * (squared_length(pos1 - pos2) / (radius*radius)))
 //           + (1.0f - compactness) * ((1.0f - normal_weight) * (0.001f * squared_length(lab1 - lab2))
@@ -1007,6 +1007,7 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				  const float normal_weight,
 				  const float lambda,
 				  const float radius_meter,
+				  const int max_iterations,
 				  const int nb_clusters,
 				  const int step,
 				  const int width,
@@ -1039,8 +1040,9 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 //     __syncthreads();
     
     int cur_queue = 0;
-
-    for(;;)
+    bool finished = false;
+    
+    for(int k=0; k<max_iterations && !finished; k++)
     {
 	for(;;)
 	{
@@ -1077,8 +1079,11 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 		    if(npos.x>=0 && npos.x<width
 		       && npos.y>=0 && npos.y<height)
 		    {
-
 			float3 position = make_float3(tex2D<float4>(tex_positions, npos.x, npos.y));
+			
+			if(position.z<=0.f)
+			    continue;
+			
 			float3 color = make_float3(tex2D<float4>(tex_lab, npos.x, npos.y));
 			float3 normal = make_float3(tex2D<float4>(tex_normals, npos.x, npos.y));
 			float density = tex2D<float>(tex_density, npos.x, npos.y);
@@ -1157,8 +1162,8 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 				    atomicAdd(&acc_shapes[label].zz, 0.f);
 				    */
 				    
-				    if(position.z!=0)
-				    {
+// 				    if(position.z!=0)
+// 				    {
 					atomicAdd(&acc_positions_sizes[label].x, position.x);
 					atomicAdd(&acc_positions_sizes[label].y, position.y);
 					atomicAdd(&acc_positions_sizes[label].z, position.z);
@@ -1202,7 +1207,7 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 					atomicAdd(&acc_shapes[cur_label].yy, -cov.yy);
 					atomicAdd(&acc_shapes[cur_label].yz, -cov.yz);
 					atomicAdd(&acc_shapes[cur_label].zz, -cov.zz);
-				    }
+// 				    }
 				    
 				    break;
 				}
@@ -1238,8 +1243,14 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 	
 	if(queue[1-cur_queue].nbElt==0)
 	{
+	    finished = true;
+// 	    if(tid==0 && blockIdx.x==0)
+// 	    {
+// 		printf("iterations : %d\n", k);
+// 	    }
+	    
 // 	    printf("return\n");
-	    return;
+// 	    return;
 	}
 
 	__syncthreads();
@@ -1290,6 +1301,7 @@ __global__ void daspProcessKernel(float4* __restrict__ positions,
 	syncAllThreads(&syncCounter[1]);
 	
     }
+
 }
 
 
